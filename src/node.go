@@ -3,15 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand/v2"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 type NodeWrapper struct {
-	id   int
-	node *maelstrom.Node
+	node  *maelstrom.Node
+	id    string
+	idMtx sync.RWMutex
 
 	seqMtx sync.Mutex
 	seqNum int
@@ -22,20 +22,32 @@ type NodeWrapper struct {
 
 func NewNode() *NodeWrapper {
 	n := NodeWrapper{
-		id:              -1,
 		node:            maelstrom.NewNode(),
 		receivedNumbers: []int{},
 	}
-	n.DefineHandlers()
+	n.defineHandlers()
 	return &n
 }
 
-func (n *NodeWrapper) DefineHandlers() {
-	n.node.Handle("echo", n.echo)
+func (n *NodeWrapper) defineHandlers() {
+	n.node.Handle("init", n.init)
 	n.node.Handle("generate", n.generate)
 	n.node.Handle("broadcast", n.broadcast)
 	n.node.Handle("read", n.read)
 	n.node.Handle("topology", n.topology)
+}
+
+func (n *NodeWrapper) init(msg maelstrom.Message) error {
+	var body struct {
+		ID string `json:"node_id"`
+	}
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return err
+	}
+	n.setID(body.ID)
+	responseBody := map[string]string{}
+	responseBody["type"] = "init_ok"
+	return n.node.Reply(msg, responseBody)
 }
 
 func (n *NodeWrapper) echo(msg maelstrom.Message) error {
@@ -100,10 +112,7 @@ func (n *NodeWrapper) generateID() string {
 	n.seqMtx.Lock()
 	defer n.seqMtx.Unlock()
 	n.seqNum++
-	if n.id == -1 {
-		n._setRandomID()
-	}
-	id := fmt.Sprintf("%d_%d", n.id, n.seqNum)
+	id := fmt.Sprintf("%s_%d", n.getID(), n.seqNum)
 	return id
 
 }
@@ -124,6 +133,14 @@ func (n *NodeWrapper) getReceivedNumbers() *[]int {
 }
 
 // the calling method should hold the mutex
-func (n *NodeWrapper) _setRandomID() {
-	n.id = rand.IntN(100)
+func (n *NodeWrapper) setID(id string) {
+	n.idMtx.Lock()
+	defer n.idMtx.Unlock()
+	n.id = id
+}
+
+func (n *NodeWrapper) getID() string {
+	n.idMtx.RLock()
+	defer n.idMtx.RLock()
+	return n.id
 }

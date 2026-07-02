@@ -18,12 +18,20 @@ type NodeWrapper struct {
 
 	bcMtx           sync.RWMutex
 	receivedNumbers []int
+
+	neighborsMtx sync.Mutex
+	neighbors    []string
+
+	broadcastMtx        sync.RWMutex
+	processedBroadCasts map[string]bool
 }
 
 func NewNode() *NodeWrapper {
 	n := NodeWrapper{
-		node:            maelstrom.NewNode(),
-		receivedNumbers: []int{},
+		node:                maelstrom.NewNode(),
+		receivedNumbers:     []int{},
+		neighbors:           []string{},
+		processedBroadCasts: map[string]bool{},
 	}
 	n.defineHandlers()
 	return &n
@@ -33,6 +41,7 @@ func (n *NodeWrapper) defineHandlers() {
 	n.node.Handle("init", n.init)
 	n.node.Handle("generate", n.generate)
 	n.node.Handle("broadcast", n.broadcast)
+	n.node.Handle("broadcast_ok", n.broadcastOk)
 	n.node.Handle("read", n.read)
 	n.node.Handle("topology", n.topology)
 }
@@ -69,23 +78,47 @@ func (n *NodeWrapper) generate(msg maelstrom.Message) error {
 	return n.node.Reply(msg, body)
 }
 
+type boardcastBody struct {
+	Type        string `json:"type"`
+	Message     int    `json:"message"`
+	BoardcastID string `json:"braodcast_id"`
+}
+
 func (n *NodeWrapper) broadcast(msg maelstrom.Message) error {
-	var body struct {
-		Type    string `json:"type"`
-		Message int    `json:"message"`
-	}
+	n.neighborsMtx.Lock()
+	defer n.neighborsMtx.Unlock()
+	body := boardcastBody{}
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
-	n.addNumToReceivedBC(body.Message)
-	respBody := map[string]string{
-		"type": "topology_ok",
+	id := body.BoardcastID
+	if id == "" || !n.isBoardcastIDAlreadyProcessed(id) {
+		n.addNumToReceivedBC(body.Message)
+		go n.propagateToNeighbors(body)
+		if id != "" {
+			n.markProcessBoardcastID(id)
+		}
 	}
-
-	respBody["type"] = "broadcast_ok"
+	respBody := map[string]string{
+		"type": "broadcast_ok",
+	}
 	return n.node.Reply(msg, respBody)
 }
 
+func (n *NodeWrapper) broadcastOk(_msg maelstrom.Message) error {
+	return nil
+}
+
+func (n *NodeWrapper) propagateToNeighbors(msg boardcastBody) {
+	neighbors := n.getNeighbors()
+	if msg.BoardcastID == "" {
+		id := n.generateID()
+		msg.BoardcastID = id
+	}
+	for _, neighbor := range neighbors {
+		n.node.Send(neighbor, msg)
+	}
+}
 func (n *NodeWrapper) read(msg maelstrom.Message) error {
 	var body map[string]any
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
@@ -98,10 +131,17 @@ func (n *NodeWrapper) read(msg maelstrom.Message) error {
 }
 
 func (n *NodeWrapper) topology(msg maelstrom.Message) error {
-	var body map[string]any
+	n.neighborsMtx.Lock()
+	defer n.neighborsMtx.Unlock()
+	var body struct {
+		Type     string              `json:"type"`
+		Topology map[string][]string `json:"topology"`
+	}
 	if err := json.Unmarshal(msg.Body, &body); err != nil {
 		return err
 	}
+	neighbors := body.Topology[n.getID()]
+	n.setNeighbors(neighbors)
 	respBody := map[string]string{
 		"type": "topology_ok",
 	}
@@ -115,6 +155,16 @@ func (n *NodeWrapper) generateID() string {
 	id := fmt.Sprintf("%s_%d", n.getID(), n.seqNum)
 	return id
 
+}
+
+func (n *NodeWrapper) setNeighbors(neighbors []string) {
+	n.neighbors = neighbors
+}
+
+func (n *NodeWrapper) getNeighbors() []string {
+	neighbors := make([]string, len(n.neighbors))
+	copy(neighbors, n.neighbors)
+	return neighbors
 }
 
 func (n *NodeWrapper) addNumToReceivedBC(msg int) {
@@ -141,6 +191,14 @@ func (n *NodeWrapper) setID(id string) {
 
 func (n *NodeWrapper) getID() string {
 	n.idMtx.RLock()
-	defer n.idMtx.RLock()
+	defer n.idMtx.RUnlock()
 	return n.id
+}
+
+func (n *NodeWrapper) markProcessBoardcastID(id string) {
+	n.processedBroadCasts[id] = true
+}
+func (n *NodeWrapper) isBoardcastIDAlreadyProcessed(id string) bool {
+	_, ok := n.processedBroadCasts[id]
+	return ok
 }
